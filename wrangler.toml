@@ -1,4 +1,4 @@
-name = "kkphim-stremio-addon"
+name = "kkphim-addon"
 main = "src/index.ts"
 compatibility_date = "2024-02-22"
 

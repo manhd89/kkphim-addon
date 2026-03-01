@@ -54,7 +54,7 @@ export async function handleStream(type: string, idRaw: string, origin: string) 
                 streams.push({
                     name: `KKPhim\n${s.server_name}`,
                     title: `${result.movie.name}\n${ep.name} [${result.movie.quality || 'FHD'}]`,
-                    url: `${origin}/p/v/${mask(ep.link_m3u8)}/index.m3u8`
+                    url: ep.link_m3u8
                 })
             }
         })

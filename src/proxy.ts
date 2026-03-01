@@ -1,6 +1,6 @@
-// src/proxy.ts
 import { KKPHIM_PROXY_KEY, KKPHIM_REFERER } from './utils/key';
 
+// Salted XOR Hex Encoder/Decoder
 export const mask = (str: string) => {
     const salt = Math.floor(Math.random() * 256);
     const saltHex = salt.toString(16).padStart(2, '0');
@@ -25,82 +25,84 @@ const unmask = (hex: string) => {
 const resolveUrl = (base: string, rel: string) => {
     if (rel.startsWith('http')) return rel;
     if (rel.startsWith('//')) return 'https:' + rel;
-    return new URL(rel, base).href;
+    try {
+        return new URL(rel, base).href;
+    } catch {
+        return rel;
+    }
 };
 
 export async function handleProxy(c: any) {
     const hex = c.req.param('hex');
-    const type = c.req.path.split('/')[2];
+    const pathParts = c.req.path.split('/');
+    const type = pathParts[2]; // 'i' hoặc 'v'
+    
     const targetUrl = unmask(hex).trim();
+    if (!targetUrl) return c.text('Invalid Proxy Token', 400);
 
-    if (!targetUrl) return c.text('Invalid token', 400);
-
-    const headers = {
+    const headers: any = {
         'Referer': KKPHIM_REFERER,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36',
-        'Accept-Encoding': 'identity' // Tránh gzip để xử lý text dễ hơn
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': '*/*'
     };
 
     try {
         const res = await fetch(targetUrl, { headers });
-        if (!res.ok) return c.text('Source Error', res.status);
+        if (!res.ok) return c.text(`Source Error: ${res.status}`, res.status);
 
-        // KIỂM TRA NHANH: Nếu là file .ts hoặc ảnh, pipe thẳng luôn (Cực nhẹ CPU)
         const contentType = res.headers.get('content-type') || '';
-        const isPlaylist = targetUrl.includes('.m3u8') || contentType.includes('mpegurl');
+        const isM3U8 = targetUrl.includes('.m3u8') || contentType.includes('mpegurl') || contentType.includes('application/x-mpegURL');
 
-        if (type !== 'v' || !isPlaylist) {
-            const { readable, writable } = new TransformStream();
-            res.body?.pipeTo(writable);
-            return new Response(readable, {
-                status: res.status,
+        // CHẾ ĐỘ 1: Xử lý Playlist (.m3u8)
+        if (type === 'v' && isM3U8) {
+            let content = await res.text();
+            const workerOrigin = new URL(c.req.url).origin;
+
+            const newContent = content.split('\n').map(line => {
+                const trimmed = line.trim();
+                if (!trimmed) return line;
+
+                // Rewrite các Tag chứa URI (như Key mã hóa)
+                if (trimmed.startsWith('#')) {
+                    return line.replace(/(URI=")([^"]+)(")/g, (m, p1, p2, p3) => {
+                        const abs = resolveUrl(targetUrl, p2);
+                        return `${p1}${workerOrigin}/p/v/${mask(abs)}/key.bin${p3}`;
+                    });
+                }
+
+                // Rewrite đường dẫn Playlist con hoặc Video Segment
+                const absoluteUrl = resolveUrl(targetUrl, trimmed);
+                const isSubM3U8 = absoluteUrl.includes('.m3u8');
+                const suffix = isSubM3U8 ? 'index.m3u8' : 'video.ts';
+                
+                return `${workerOrigin}/p/v/${mask(absoluteUrl)}/${suffix}`;
+            }).join('\n');
+
+            return new Response(newContent, {
                 headers: {
-                    'Content-Type': contentType,
+                    'Content-Type': 'application/vnd.apple.mpegurl',
                     'Access-Control-Allow-Origin': '*',
-                    'Cache-Control': 'public, max-age=14400'
+                    'Cache-Control': 'no-cache'
                 }
             });
         }
 
-        // CHỈ XỬ LÝ M3U8 TẠI ĐÂY
-        let content = await res.text();
-        const origin = new URL(c.req.url).origin;
-        const lines = content.split('\n');
-        let output = '';
+        // CHẾ ĐỘ 2: Xử lý Binary (Ảnh, .ts, .key)
+        // Sử dụng pipe để stream dữ liệu, tiết kiệm RAM cho Worker
+        const { readable, writable } = new TransformStream();
+        res.body?.pipeTo(writable);
 
-        for (let i = 0; i < lines.length; i++) {
-            const line = lines[i].trim();
-            if (!line) {
-                output += '\n';
-                continue;
-            }
-
-            if (line.startsWith('#')) {
-                // Chỉ rewrite nếu có URI (Key mã hóa)
-                if (line.includes('URI=')) {
-                    output += line.replace(/URI="([^"]+)"/, (m, p1) => {
-                        return `URI="${origin}/p/v/${mask(resolveUrl(targetUrl, p1))}/key.bin"`;
-                    }) + '\n';
-                } else {
-                    output += line + '\n';
-                }
-            } else {
-                // Line là URL
-                const abs = resolveUrl(targetUrl, line);
-                const isM3 = abs.includes('.m3u8');
-                output += `${origin}/p/v/${mask(abs)}/${isM3 ? 'i.m3u8' : 's.ts'}\n`;
-            }
-        }
-
-        return new Response(output, {
+        return new Response(readable, {
+            status: res.status,
             headers: {
-                'Content-Type': 'application/vnd.apple.mpegurl',
+                'Content-Type': contentType || 'application/octet-stream',
                 'Access-Control-Allow-Origin': '*',
-                'Cache-Control': 'no-cache'
+                'Cache-Control': type === 'i' ? 'public, max-age=2592000' : 'public, max-age=3600'
             }
         });
 
     } catch (e: any) {
-        return c.text('Proxy Crash', 500);
+        console.error(`[Proxy] Error: ${e.message}`);
+        return c.text(`Proxy Error: ${e.message}`, 500);
     }
 }

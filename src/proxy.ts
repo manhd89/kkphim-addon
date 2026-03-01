@@ -1,14 +1,14 @@
-const KKPHIM_IMG_ROOT = 'https://phimimg.com/uploads/movies/';
 import { KKPHIM_PROXY_KEY, KKPHIM_REFERER } from './utils/key';
 
-// Salted XOR Hex Encoder/Decoder (Robust version)
-const mask = (str: string) => {
+// Salted XOR Hex Encoder/Decoder
+export const mask = (str: string) => {
     const salt = Math.floor(Math.random() * 256);
     const saltHex = salt.toString(16).padStart(2, '0');
     const encoded = encodeURIComponent(str);
     const masked = Array.from(encoded).map(c => (c.charCodeAt(0) ^ KKPHIM_PROXY_KEY ^ salt).toString(16).padStart(2, '0')).join('');
     return saltHex + masked;
 }
+
 const unmask = (hex: string) => {
     try {
         const salt = parseInt(hex.substring(0, 2), 16);
@@ -25,120 +25,84 @@ const unmask = (hex: string) => {
 const resolveUrl = (base: string, rel: string) => {
     if (rel.startsWith('http')) return rel;
     if (rel.startsWith('//')) return 'https:' + rel;
-    const url = new URL(base);
-    if (rel.startsWith('/')) return url.origin + rel;
-    const dir = base.substring(0, base.lastIndexOf('/') + 1);
-    return dir + rel;
+    try {
+        return new URL(rel, base).href;
+    } catch {
+        return rel;
+    }
 };
 
 export async function handleProxy(c: any) {
-    const segments = c.req.path.split('/');
-    const type = segments[2];
+    const hex = c.req.param('hex');
+    const pathParts = c.req.path.split('/');
+    const type = pathParts[2]; // 'i' hoặc 'v'
+    
+    const targetUrl = unmask(hex).trim();
+    if (!targetUrl) return c.text('Invalid Proxy Token', 400);
 
-    const browserHeaders = {
-        'accept': '*/*',
-        'accept-language': 'vi,en;q=0.9,en-GB;q=0.8,en-US;q=0.7,fr-FR;q=0.6,fr;q=0.5',
-        'cache-control': 'no-cache',
-        'pragma': 'no-cache',
-        'priority': 'u=1, i',
-        'sec-ch-ua': '"Not:A-Brand";v="99", "Microsoft Edge";v="145", "Chromium";v="145"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-        'sec-fetch-dest': 'empty',
-        'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'cross-site',
+    const headers: any = {
         'Referer': KKPHIM_REFERER,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': '*/*'
     };
 
-    if (type === 'i') {
-        const hex = c.req.param('hex');
-        const targetUrl = unmask(hex).trim();
-        if (!targetUrl) return c.text('Invalid image token', 400);
+    try {
+        const res = await fetch(targetUrl, { headers });
+        if (!res.ok) return c.text(`Source Error: ${res.status}`, res.status);
 
-        const cache = (caches as any).default;
-        const cacheKey = new Request(c.req.url);
-        let cached = await cache.match(cacheKey);
-        if (cached) return cached;
-        try {
-            const res = await fetch(targetUrl, {
-                headers: browserHeaders,
-                redirect: 'follow'
+        const contentType = res.headers.get('content-type') || '';
+        const isM3U8 = targetUrl.includes('.m3u8') || contentType.includes('mpegurl') || contentType.includes('application/x-mpegURL');
+
+        // CHẾ ĐỘ 1: Xử lý Playlist (.m3u8)
+        if (type === 'v' && isM3U8) {
+            let content = await res.text();
+            const workerOrigin = new URL(c.req.url).origin;
+
+            const newContent = content.split('\n').map(line => {
+                const trimmed = line.trim();
+                if (!trimmed) return line;
+
+                // Rewrite các Tag chứa URI (như Key mã hóa)
+                if (trimmed.startsWith('#')) {
+                    return line.replace(/(URI=")([^"]+)(")/g, (m, p1, p2, p3) => {
+                        const abs = resolveUrl(targetUrl, p2);
+                        return `${p1}${workerOrigin}/p/v/${mask(abs)}/key.bin${p3}`;
+                    });
+                }
+
+                // Rewrite đường dẫn Playlist con hoặc Video Segment
+                const absoluteUrl = resolveUrl(targetUrl, trimmed);
+                const isSubM3U8 = absoluteUrl.includes('.m3u8');
+                const suffix = isSubM3U8 ? 'index.m3u8' : 'video.ts';
+                
+                return `${workerOrigin}/p/v/${mask(absoluteUrl)}/${suffix}`;
+            }).join('\n');
+
+            return new Response(newContent, {
+                headers: {
+                    'Content-Type': 'application/vnd.apple.mpegurl',
+                    'Access-Control-Allow-Origin': '*',
+                    'Cache-Control': 'no-cache'
+                }
             });
-            if (!res.ok) return c.text(`Image Source Error: ${res.status}`, res.status);
-
-            let newRes = new Response(res.body, res);
-            newRes.headers.set('Access-Control-Allow-Origin', '*');
-            newRes.headers.set('Cache-Control', 'public, max-age=2592000');
-            c.executionCtx.waitUntil(cache.put(cacheKey, newRes.clone()));
-            return newRes;
-        } catch (e) { return c.text('Image Proxy Exception', 500); }
-    }
-
-    if (type === 'v') {
-        const hex = c.req.param('hex');
-        const baseUrl = unmask(hex).trim();
-        if (!baseUrl) return c.text('Invalid video token', 400);
-
-        const targetUrl = baseUrl;
-        console.log(`[Proxy Video] Fetching: ${targetUrl}`);
-
-        try {
-            const res = await fetch(targetUrl, {
-                method: 'GET',
-                headers: browserHeaders,
-                redirect: 'follow'
-            });
-
-            if (!res.ok) {
-                const headStr = JSON.stringify([...res.headers]);
-                console.error(`[Proxy Video] Source Failed: ${res.status}. Headers: ${headStr}`);
-                return c.text(`Source Error: ${res.status} | URL: ${targetUrl}`, res.status);
-            }
-
-            const contentType = res.headers.get('content-type') || '';
-            const isPlaylist = targetUrl.includes('.m3u8') || contentType.includes('mpegurl');
-
-            if (isPlaylist) {
-                let content = await res.text();
-                const workerOrigin = new URL(c.req.url).origin;
-
-                const maskUrl = (url: string) => {
-                    const resolved = resolveUrl(targetUrl, url);
-                    const filename = (resolved.split('/').pop() || 'file.m3u8').split('?')[0];
-                    return `${workerOrigin}/p/v/${mask(resolved)}/${filename}`;
-                };
-
-                content = content.split('\n').map(line => {
-                    const trimmed = line.trim();
-                    if (!trimmed || trimmed.startsWith('#')) return line;
-                    return maskUrl(trimmed);
-                }).join('\n');
-
-                content = content.replace(/(URI=")([^"]+)(")/g, (m, p1, p2, p3) => {
-                    return `${p1}${maskUrl(p2)}${p3}`;
-                });
-
-                return new Response(content, {
-                    headers: {
-                        'Content-Type': 'application/vnd.apple.mpegurl',
-                        'Access-Control-Allow-Origin': '*',
-                        'Cache-Control': 'no-cache'
-                    }
-                });
-            }
-
-            let newRes = new Response(res.body, res);
-            newRes.headers.set('Access-Control-Allow-Origin', '*');
-            newRes.headers.delete('set-cookie');
-            return newRes;
-
-        } catch (e: any) {
-            console.error(`[Proxy Video] Exception: ${e.message}`);
-            return c.text(`Proxy Exception: ${e.message}`, 500);
         }
-    }
-    return c.text('Not Found', 404);
-}
 
-export { mask };
+        // CHẾ ĐỘ 2: Xử lý Binary (Ảnh, .ts, .key)
+        // Sử dụng pipe để stream dữ liệu, tiết kiệm RAM cho Worker
+        const { readable, writable } = new TransformStream();
+        res.body?.pipeTo(writable);
+
+        return new Response(readable, {
+            status: res.status,
+            headers: {
+                'Content-Type': contentType || 'application/octet-stream',
+                'Access-Control-Allow-Origin': '*',
+                'Cache-Control': type === 'i' ? 'public, max-age=2592000' : 'public, max-age=3600'
+            }
+        });
+
+    } catch (e: any) {
+        console.error(`[Proxy] Error: ${e.message}`);
+        return c.text(`Proxy Error: ${e.message}`, 500);
+    }
+}

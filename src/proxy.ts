@@ -1,6 +1,7 @@
 import { KKPHIM_PROXY_KEY, KKPHIM_REFERER } from './utils/key';
 
-// Salted XOR Hex Encoder/Decoder
+// --- Helpers ---
+
 export const mask = (str: string) => {
     const salt = Math.floor(Math.random() * 256);
     const saltHex = salt.toString(16).padStart(2, '0');
@@ -25,12 +26,64 @@ const unmask = (hex: string) => {
 const resolveUrl = (base: string, rel: string) => {
     if (rel.startsWith('http')) return rel;
     if (rel.startsWith('//')) return 'https:' + rel;
-    try {
-        return new URL(rel, base).href;
-    } catch {
-        return rel;
-    }
+    try { return new URL(rel, base).href; } catch { return rel; }
 };
+
+/**
+ * Hàm làm sạch Manifest: Xóa quảng cáo và sửa path lỗi /convertv7/
+ */
+function cleanManifest(manifest: string): string {
+    const lines = manifest.split(/\r?\n/);
+    const result: string[] = [];
+    let i = 0;
+
+    while (i < lines.length) {
+        const line = lines[i].trim();
+
+        if (line !== "#EXT-X-DISCONTINUITY") {
+            result.push(lines[i]);
+            i++;
+            continue;
+        }
+
+        const start = i;
+        let j = i + 1;
+        let segments = 0;
+        let hasKeyNone = false;
+
+        while (j < lines.length) {
+            const l = lines[j].trim();
+            if (l.startsWith("#EXTINF:")) segments++;
+            if (l.includes("#EXT-X-KEY:METHOD=NONE")) hasKeyNone = true;
+            if (l === "#EXT-X-DISCONTINUITY") break;
+            j++;
+        }
+
+        if (j >= lines.length) {
+            result.push(lines[i]);
+            i++;
+            continue;
+        }
+
+        // Điều kiện lọc quảng cáo của bạn
+        if (hasKeyNone || (segments >= 5 && segments <= 20)) {
+            i = j + 1;
+            continue;
+        }
+
+        for (let k = start; k <= j; k++) {
+            result.push(lines[k]);
+        }
+        i = j + 1;
+    }
+
+    return result.join("\n")
+        .replace(/\/convertv7\//g, "/") // Sửa lỗi path đặc thù
+        .replace(/\n{2,}/g, "\n")
+        .trim();
+}
+
+// --- Main Handler ---
 
 export async function handleProxy(c: any) {
     const hex = c.req.param('hex');
@@ -43,7 +96,6 @@ export async function handleProxy(c: any) {
     const headers: any = {
         'Referer': KKPHIM_REFERER,
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': '*/*'
     };
 
     try {
@@ -51,18 +103,18 @@ export async function handleProxy(c: any) {
         if (!res.ok) return c.text(`Source Error: ${res.status}`, res.status);
 
         const contentType = res.headers.get('content-type') || '';
-        const isM3U8 = targetUrl.includes('.m3u8') || contentType.includes('mpegurl') || contentType.includes('application/x-mpegURL');
+        const isM3U8 = targetUrl.includes('.m3u8') || contentType.includes('mpegurl');
 
         // CHẾ ĐỘ 1: Xử lý Playlist (.m3u8)
         if (type === 'v' && isM3U8) {
             let content = await res.text();
             const workerOrigin = new URL(c.req.url).origin;
 
-            const newContent = content.split('\n').map(line => {
+            // Bước 1: Rewrite URL sang Proxy
+            let rewrittenContent = content.split('\n').map(line => {
                 const trimmed = line.trim();
                 if (!trimmed) return line;
 
-                // Rewrite các Tag chứa URI (như Key mã hóa)
                 if (trimmed.startsWith('#')) {
                     return line.replace(/(URI=")([^"]+)(")/g, (m, p1, p2, p3) => {
                         const abs = resolveUrl(targetUrl, p2);
@@ -70,15 +122,16 @@ export async function handleProxy(c: any) {
                     });
                 }
 
-                // Rewrite đường dẫn Playlist con hoặc Video Segment
                 const absoluteUrl = resolveUrl(targetUrl, trimmed);
                 const isSubM3U8 = absoluteUrl.includes('.m3u8');
                 const suffix = isSubM3U8 ? 'index.m3u8' : 'video.ts';
-                
                 return `${workerOrigin}/p/v/${mask(absoluteUrl)}/${suffix}`;
             }).join('\n');
 
-            return new Response(newContent, {
+            // Bước 2: Apply Clean Logic (Xóa quảng cáo & Fix path)
+            const finalContent = cleanManifest(rewrittenContent);
+
+            return new Response(finalContent, {
                 headers: {
                     'Content-Type': 'application/vnd.apple.mpegurl',
                     'Access-Control-Allow-Origin': '*',
@@ -88,7 +141,6 @@ export async function handleProxy(c: any) {
         }
 
         // CHẾ ĐỘ 2: Xử lý Binary (Ảnh, .ts, .key)
-        // Sử dụng pipe để stream dữ liệu, tiết kiệm RAM cho Worker
         const { readable, writable } = new TransformStream();
         res.body?.pipeTo(writable);
 
@@ -102,7 +154,6 @@ export async function handleProxy(c: any) {
         });
 
     } catch (e: any) {
-        console.error(`[Proxy] Error: ${e.message}`);
         return c.text(`Proxy Error: ${e.message}`, 500);
     }
 }

@@ -1,15 +1,21 @@
 import { KKPHIM_PROXY_KEY, KKPHIM_REFERER } from './utils/key';
 
-// --- Helpers ---
-
+/**
+ * 1. MÃ HÓA URL (MASK)
+ */
 export const mask = (str: string) => {
     const salt = Math.floor(Math.random() * 256);
     const saltHex = salt.toString(16).padStart(2, '0');
     const encoded = encodeURIComponent(str);
-    const masked = Array.from(encoded).map(c => (c.charCodeAt(0) ^ KKPHIM_PROXY_KEY ^ salt).toString(16).padStart(2, '0')).join('');
+    const masked = Array.from(encoded).map(c => 
+        (c.charCodeAt(0) ^ KKPHIM_PROXY_KEY ^ salt).toString(16).padStart(2, '0')
+    ).join('');
     return saltHex + masked;
 }
 
+/**
+ * 2. GIẢI MÃ URL (UNMASK)
+ */
 const unmask = (hex: string) => {
     try {
         const salt = parseInt(hex.substring(0, 2), 16);
@@ -23,20 +29,28 @@ const unmask = (hex: string) => {
     } catch { return ''; }
 }
 
+/**
+ * 3. CHUYỂN URL TƯƠNG ĐỐI THÀNH TUYỆT ĐỐI
+ */
 const resolveUrl = (base: string, rel: string) => {
     if (rel.startsWith('http')) return rel;
     if (rel.startsWith('//')) return 'https:' + rel;
-    try { return new URL(rel, base).href; } catch { return rel; }
+    try {
+        return new URL(rel, base).href;
+    } catch {
+        return rel;
+    }
 };
 
 /**
- * Hàm làm sạch Manifest: Xóa quảng cáo và sửa path lỗi /convertv7/
+ * 4. LÀM SẠCH MANIFEST (XÓA QUẢNG CÁO & FIX PATH)
+ * Thực hiện trên nội dung thô (Raw text) từ server gốc
  */
 function cleanManifest(manifest: string): string {
     const lines = manifest.split(/\r?\n/);
     const result: string[] = [];
-    let i = 0;
 
+    let i = 0;
     while (i < lines.length) {
         const line = lines[i].trim();
 
@@ -65,7 +79,7 @@ function cleanManifest(manifest: string): string {
             continue;
         }
 
-        // Điều kiện lọc quảng cáo của bạn
+        // Logic loại bỏ đoạn quảng cáo
         if (hasKeyNone || (segments >= 5 && segments <= 20)) {
             i = j + 1;
             continue;
@@ -78,17 +92,18 @@ function cleanManifest(manifest: string): string {
     }
 
     return result.join("\n")
-        .replace(/\/convertv7\//g, "/") // Sửa lỗi path đặc thù
+        .replace(/\/convertv7\//g, "/") // Fix lỗi đường dẫn đặc thù của KKPhim
         .replace(/\n{2,}/g, "\n")
         .trim();
 }
 
-// --- Main Handler ---
-
+/**
+ * 5. HANDLER CHÍNH
+ */
 export async function handleProxy(c: any) {
     const hex = c.req.param('hex');
     const pathParts = c.req.path.split('/');
-    const type = pathParts[2]; // 'i' hoặc 'v'
+    const type = pathParts[2]; // 'i' (image) hoặc 'v' (video/m3u8)
     
     const targetUrl = unmask(hex).trim();
     if (!targetUrl) return c.text('Invalid Proxy Token', 400);
@@ -96,6 +111,7 @@ export async function handleProxy(c: any) {
     const headers: any = {
         'Referer': KKPHIM_REFERER,
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': '*/*'
     };
 
     try {
@@ -105,16 +121,20 @@ export async function handleProxy(c: any) {
         const contentType = res.headers.get('content-type') || '';
         const isM3U8 = targetUrl.includes('.m3u8') || contentType.includes('mpegurl');
 
-        // CHẾ ĐỘ 1: Xử lý Playlist (.m3u8)
+        // --- CHẾ ĐỘ 1: Xử lý Playlist (.m3u8) ---
         if (type === 'v' && isM3U8) {
-            let content = await res.text();
+            const rawContent = await res.text();
             const workerOrigin = new URL(c.req.url).origin;
 
-            // Bước 1: Rewrite URL sang Proxy
-            let rewrittenContent = content.split('\n').map(line => {
-                const trimmed = line.trim();
-                if (!trimmed) return line;
+            // BƯỚC A: Làm sạch nội dung gốc trước (Xóa QC, Fix path)
+            const cleanedContent = cleanManifest(rawContent);
 
+            // BƯỚC B: Thực hiện Proxy Masking trên nội dung đã sạch
+            const finalContent = cleanedContent.split('\n').map(line => {
+                const trimmed = line.trim();
+                if (!trimmed || trimmed.startsWith('#EXT-X-ENDLIST')) return line;
+
+                // 1. Rewrite các Tag chứa URI (ví dụ: #EXT-X-KEY:METHOD=AES-128,URI="...")
                 if (trimmed.startsWith('#')) {
                     return line.replace(/(URI=")([^"]+)(")/g, (m, p1, p2, p3) => {
                         const abs = resolveUrl(targetUrl, p2);
@@ -122,14 +142,13 @@ export async function handleProxy(c: any) {
                     });
                 }
 
+                // 2. Rewrite đường dẫn Video Segment (.ts) hoặc Playlist con
                 const absoluteUrl = resolveUrl(targetUrl, trimmed);
                 const isSubM3U8 = absoluteUrl.includes('.m3u8');
                 const suffix = isSubM3U8 ? 'index.m3u8' : 'video.ts';
+                
                 return `${workerOrigin}/p/v/${mask(absoluteUrl)}/${suffix}`;
             }).join('\n');
-
-            // Bước 2: Apply Clean Logic (Xóa quảng cáo & Fix path)
-            const finalContent = cleanManifest(rewrittenContent);
 
             return new Response(finalContent, {
                 headers: {
@@ -140,7 +159,7 @@ export async function handleProxy(c: any) {
             });
         }
 
-        // CHẾ ĐỘ 2: Xử lý Binary (Ảnh, .ts, .key)
+        // --- CHẾ ĐỘ 2: Xử lý Binary (Ảnh, .ts, .key) ---
         const { readable, writable } = new TransformStream();
         res.body?.pipeTo(writable);
 
@@ -154,6 +173,7 @@ export async function handleProxy(c: any) {
         });
 
     } catch (e: any) {
+        console.error(`[Proxy] Error: ${e.message}`);
         return c.text(`Proxy Error: ${e.message}`, 500);
     }
 }

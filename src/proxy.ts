@@ -58,41 +58,58 @@ const resolveUrl = (base: string, rel: string) => {
 /**
  * 4. CLEAN MANIFEST
  */
-function cleanManifest(manifest: string) {
+function cleanManifest(manifest) {
   const lines = manifest.split(/\r?\n/);
-  const result: string[] = [];
+  const result = [];
 
   let i = 0;
 
   while (i < lines.length) {
     const line = lines[i].trim();
 
-    if (line === "#EXT-X-DISCONTINUITY") {
-      let j = i + 1;
-      let segments = 0;
-
-      while (j < lines.length) {
-        const l = lines[j].trim();
-
-        if (l.startsWith("#EXTINF")) segments++;
-        if (l === "#EXT-X-DISCONTINUITY") break;
-
-        j++;
-      }
-
-      // quảng cáo thường <5 segment
-      if (segments > 0 && segments < 5) {
-        i = j;
-        continue;
-      }
+    if (line !== "#EXT-X-DISCONTINUITY") {
+      result.push(lines[i]);
+      i++;
+      continue;
     }
 
-    result.push(lines[i]);
-    i++;
+    const start = i;
+    let j = i + 1;
+    let segments = 0;
+    let hasKeyNone = false;
+
+    while (j < lines.length) {
+      const l = lines[j].trim();
+
+      if (l.startsWith("#EXTINF:")) segments++;
+
+      if (l.includes("#EXT-X-KEY:METHOD=NONE"))
+        hasKeyNone = true;
+
+      if (l === "#EXT-X-DISCONTINUITY") break;
+
+      j++;
+    }
+
+    if (j >= lines.length) {
+      result.push(lines[i]);
+      i++;
+      continue;
+    }
+
+    if (hasKeyNone || (segments >= 5 && segments <= 20)) {
+      i = j + 1;
+      continue;
+    }
+
+    for (let k = start; k <= j; k++) {
+      result.push(lines[k]);
+    }
+
+    i = j + 1;
   }
 
-  return result
-    .join("\n")
+  return result.join("\n")
     .replace(/\/convertv7\//g, "/")
     .replace(/\n{2,}/g, "\n")
     .trim();
